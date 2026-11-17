@@ -1,11 +1,14 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from threading import Lock
 from time import perf_counter
 
 from app.llm.client import LLMClient, Message
 from app.llm.errors import LLMClientError
 
+from app.chat_history import ChatHistoryError, SlidingWindowHistory
+from app.conversation_summary_service import ConversationSummaryError, ConversationSummaryService
+
 from app.prompts.support_chat import SUPPORT_CHAT_PROMPT
-from skeleton import user_message
 
 CHAT_INSTRUCTION = SUPPORT_CHAT_PROMPT.render()
 
@@ -14,7 +17,13 @@ class ChatServiceError(RuntimeError): ...
 @dataclass(frozen=True)
 class ChatReply:
     text: str
-    history_messages: int          # сколько сообщений в истории после этого хода
+    session_id: str
+    history_messages: int   # сколько сообщений в истории после этого хода
+    context_history_messages: int
+    removed_history_messages: int
+    estimated_prompt_tokens: int
+    summary_updated: bool
+    has_summary: bool
     model: str
     prompt_id: str
     prompt_version: str
@@ -24,47 +33,101 @@ class ChatReply:
     total_tokens: int | None
     response_id: str
 
-class ChatService:
-    def __init__(self, llm_client: LLMClient) -> None:
-        self._llm_client = llm_client
-        self._history: list[Message] = [] # list[dict]
+@dataclass
+class ChatSession:
+    messages: list[Message] = field(default_factory=list) # у каждой сессии свой список
+    summary: str | None = None
+    lock: Lock = field(default_factory=Lock) # и своя блокировка
 
-    def reply(self, user_text: str) -> ChatReply:
+class ChatService:
+    def __init__(self,
+                 llm_client: LLMClient,
+                 history_policy: SlidingWindowHistory,
+                 summary_service: ConversationSummaryService) -> None:
+        self._llm_client = llm_client
+        self._history_policy = history_policy
+        self._summary_service = summary_service
+        self._sessions: dict[str, ChatSession] = {}
+        self._sessions_lock = Lock()
+
+    def reply(self, session_id: str, user_text: str) -> ChatReply:
+        session_key = self._normalize_session_id(session_id)
+        session = self._get_or_create_session(session_key)
         text = user_text.strip()
         if not text:
             raise ChatServiceError('Сообщение не должно быть пустым.')
 
-        user_message: Message = {
-            'role': 'user',
-            'content': f'<customer_message>\n{text}\n</customer_message>',
-        }
-        messages = [
-            {'role': 'developer', 'content': CHAT_INSTRUCTION},
-            *self._history,
-            user_message,
-        ]
+        with session.lock:
+            developer_message: Message = {'role': 'developer', 'content': CHAT_INSTRUCTION}
+            user_message: Message = {
+                'role': 'user',
+                'content': f'<customer_message>\n{text}\n</customer_message>',
+            }
+            context = [self._summary_service(session.summary)] if session.summary else []
+            try:
+                prepared = self._history_policy.prepare(
+                    developer_message=developer_message,
+                    history=session.messages,
+                    user_message=user_message,
+                    context_messages=context,
+                )
+            except ChatHistoryError as error:
+                raise ChatServiceError(f'Не удалось подготовить историю: {error}') from error
 
-        started_at = perf_counter()
-        try:
-            # ////// запрос и ответ от модели
-            result = self._llm_client.generate(messages)
-        except LLMClientError as error:
-            raise ChatServiceError(f"Не удалось получить ответ модели: {error}") from error
-        elapsed = perf_counter() - started_at
+            started_at = perf_counter()
+            new_summary: str | None = None
 
-        if result.finish_reason == "length":
-            raise ChatServiceError("Ответ обрезан по лимиту длины.")
-        if result.finish_reason != "stop":
-            raise ChatServiceError(f"Модель не дала готовый ответ: {result.finish_reason}.")
-        reply_text = (result.text or "").strip()
-        if not reply_text:
-            raise ChatServiceError("Модель вернула пустой ответ.")
-        # += это extend он распаковывает, append вкладывает список целиком
-        self._history += [user_message, {'role': 'assistant', 'content': reply_text}]
+            if prepared.removed_history_messages > 0:
+                try:
+                    new_summary = self._summary_service.summarize(
+                        previous_summary=session.summary,
+                        messages=session.messages,
+                    )
+                except ConversationSummaryError as error:
+                    raise ChatServiceError(f'Не удалось сократить историю: {error}')
+                try:
+                    prepared = self._history_policy.prepare(
+                        developer_message=developer_message,
+                        history=[],
+                        user_message=user_message,
+                        context_messages=[self._summary_message(new_summary)],
+                    )
+                except ChatHistoryError as error:
+                    raise ChatServiceError(f'Новое summary не помещается в бюджет: {error}') from error
+
+            try:
+                # ////// запрос и ответ от модели
+                result = self._llm_client.generate(prepared.messages)
+            except LLMClientError as error:
+                raise ChatServiceError(f"Не удалось получить ответ модели: {error}") from error
+            elapsed = perf_counter() - started_at
+
+            if result.finish_reason == "length":
+                raise ChatServiceError("Ответ обрезан по лимиту длины.")
+            if result.finish_reason != "stop":
+                raise ChatServiceError(f"Модель не дала готовый ответ: {result.finish_reason}.")
+            reply_text = (result.text or "").strip()
+            if not reply_text:
+                raise ChatServiceError("Модель вернула пустой ответ.")
+
+            assistant_message: Message = {'role': 'assistant', 'content': reply_text}
+            if new_summary is not None:
+                session.summary = new_summary
+                session.messages = [user_message, assistant_message]
+            else:
+                session.messages += [user_message, assistant_message]
+            history_messages = len(session.messages)
+            has_summary = session.summary is not None
 
         return ChatReply(
             text=reply_text,
-            history_messages=len(self._history),
+            session_id=session_key,
+            history_messages=history_messages,
+            context_history_messages=prepared.context_history_messages,
+            removed_history_messages=prepared.removed_history_messages,
+            estimated_prompt_tokens=prepared.estimated_tokens,
+            summary_updated=new_summary is not None,
+            has_summary=has_summary,
             model=result.model,
             prompt_id=SUPPORT_CHAT_PROMPT.prompt_id,
             prompt_version=SUPPORT_CHAT_PROMPT.version,
@@ -74,6 +137,42 @@ class ChatService:
             total_tokens=result.total_tokens,
             response_id=result.response_id,
         )
+    # for delete list[Message] from session
+    def reset_session(self, session_id: str) -> None:
+        session_key = self._normalize_session_id(session_id)
+        with self._sessions_lock:
+            session = self._sessions.get(session_key)
+        if session is None:
+            return
+        with session.lock:
+            session.messages.clear()
+            session.summary = None
+
+    def _get_or_create_session(self, session_key: str) -> ChatSession:
+        with self._sessions_lock:
+            session = self._sessions.get(session_key)
+            if session is None:
+                session = ChatSession()
+                self._sessions[session_key] = session
+            return session
+    # целый отдельный мать его метод для простого strip()
+    # причем пустой session_id сюда никак не придет
+    # тупо проверка ради проверки
+    @staticmethod
+    def _normalize_session_id(session_id: str) -> str:
+        session_key = session_id.strip()
+        if not session_key:
+            raise ChatServiceError('Session ID не должен быть пустым.')
+        return session_key
+
+    @staticmethod
+    def _summary_message(summary: str) -> Message:
+        return {
+            'role': 'user',
+            'content': f'<conversation_summary>\n{summary}\n</conversation_summary>'
+        }
+
+
 
 
 

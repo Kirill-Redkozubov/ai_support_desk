@@ -1,0 +1,3 @@
+from app.prompts.chat_history_summary.registry import get_chat_history_summary_prompt
+
+CHAT_HISTORY_SUMMARY_PROMPT = get_chat_history_summary_prompt()

@@ -14,9 +14,15 @@ class Settings(BaseSettings):
     )
     model: str = Field(default="gpt-4.1", min_length=1, validation_alias="MODEL")
     temperature: float = Field(default=0.2, ge=0, le=1, validation_alias="TEMPERATURE")
-    max_output_tokens: int = Field(default=80, gt=0, validation_alias="MAX_OUTPUT_TOKENS")
+    max_output_tokens: int = Field(default=300, gt=0, validation_alias="MAX_OUTPUT_TOKENS")
+    chat_input_token_budget: int = Field(
+        default=300, gt=0, validation_alias='CHAT_INPUT_TOKEN_BUDGET'
+    )
     request_timeout_seconds: float = Field(
         default=30.0, gt=0, validation_alias='REQUEST_TIMEOUT_SECONDS'
+    )
+    stream_timeout_seconds: float = Field(
+        default=60.0, gt=0, validation_alias='STREAM_TIMEOUT_SECONDS'
     )
     max_retries: int = Field(default=2, ge=0, le=5, validation_alias='MAX_RETRIES')
     app_env: Literal["development", "test", "production"] = Field(

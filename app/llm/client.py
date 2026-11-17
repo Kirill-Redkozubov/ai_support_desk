@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+from collections.abc import Generator
+from time import monotonic
 
 import openai
 from openai import OpenAI
@@ -27,6 +29,21 @@ class LLMResult:
     completion_tokens: int | None
     total_tokens: int | None
     response_id: str
+
+@dataclass(frozen=True)
+class LLMTextDelta:
+    text: str
+
+@dataclass(frozen=True)
+class LLMStreamCompleted:
+    model: str
+    finish_reason: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    response_id: str
+
+LLMStreamEvent = LLMTextDelta | LLMStreamCompleted
 
 class LLMClient:
     def __init__(self, settings: Settings) -> None:
@@ -63,6 +80,59 @@ class LLMClient:
             total_tokens=usage.total_tokens if usage else None,
             response_id=response.id,
         )
+
+    def stream(self, messages: list[Message]) -> Generator[LLMStreamEvent, None, None]:
+        try:
+            response_stream = self._client.chat.completions.create(
+                model=self._settings.model,
+                messages=messages,
+                temperature=self._settings.temperature,
+                max_completion_tokens=self._settings.max_output_tokens,
+                stream=True,
+                stream_options={'include_usage': True},
+            )
+        except openai.APIError as error:
+            raise self._convert_error(error) from error
+
+        started_at = monotonic()
+        model = finish_reason = response_id = None
+        prompt_tokens = completion_tokens = total_tokens = None
+
+        try:
+            for chunk in response_stream:
+                if monotonic() - started_at > self._settings.stream_timeout_seconds:
+                    raise LLMTimeoutError('Поток не завершился за отведенное время.')
+
+                model = chunk.model
+                response_id = chunk.id
+                if chunk.usage is not None:
+                    prompt_tokens = chunk.usage.completion_tokens
+                    completion_tokens = chunk.usage.completion_tokens
+                    total_tokens = chunk.usage.total_tokens
+                if not chunk.choices:
+                    continue
+
+                choice = chunk.choices[0]
+                if choice.finish_reason is not None:
+                    finish_reason = choice.finish_reason
+                if choice.delta.content:
+                    yield LLMTextDelta(text=choice.delta.content)
+        except openai.APIError as error:
+            raise self._convert_error(error) from error
+        finally:
+            response_stream.close()
+
+        if model is None or response_id is None:
+            raise LLMProviderError('Провайдер завершил поток без метаданных.')
+        yield LLMStreamCompleted(
+            model=model,
+            finish_reason=finish_reason,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            response_id=response_id,
+        )
+
 
     # тут ошибки сюда ваще не смотрим они только усложняют код
     @staticmethod
