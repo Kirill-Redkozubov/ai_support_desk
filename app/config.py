@@ -25,6 +25,7 @@ class Settings(BaseSettings):
         default=60.0, gt=0, validation_alias='STREAM_TIMEOUT_SECONDS'
     )
     max_retries: int = Field(default=2, ge=0, le=5, validation_alias='MAX_RETRIES')
+    tool_max_steps: int = Field(default=3, ge=1, le=5, validation_alias='TOOL_MAX_STEPS')
     app_env: Literal["development", "test", "production"] = Field(
         default="development",
         validation_alias="APP_ENV",

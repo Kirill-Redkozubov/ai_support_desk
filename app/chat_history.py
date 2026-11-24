@@ -1,14 +1,20 @@
 from dataclasses import dataclass
 
+# для расчета в токенах
 import tiktoken
 
+# импорт анотации для одного сообщения {'role': ..., 'content': ...}
 from app.llm.client import Message
 
+# для первоначального примерного расчета в токенах
 TOKENS_PER_MESSAGE = 3
 REPLY_PRIMER_TOKENS = 3
 
+
 class ChatHistoryError(RuntimeError): ...
 
+
+# анотация результата prepare()
 @dataclass(frozen=True)
 class PreparedHistory:
     messages: list[Message]
@@ -16,10 +22,12 @@ class PreparedHistory:
     context_history_messages: int
     removed_history_messages: int
 
+
 class TokenCounter:
     def __init__(self, encoding_name: str = 'o200k_base') -> None:
         self._encoding = tiktoken.get_encoding(encoding_name)
 
+    # считает каждый {'role':..., 'content'} в словаре и возвращает число - сумму в токенах
     def count_messages(self, messages: list[Message]) -> int:
         total = REPLY_PRIMER_TOKENS
         for message in messages:
@@ -37,28 +45,28 @@ class SlidingWindowHistory:
     def prepare(
             self,
             developer_message: Message,
-            history: list[Message],
+            history: list[Message],  # session.message
             user_message: Message,
-            context_messages: list[Message] | None = None,
+            summary_message: list[Message],  # [Message]
     ) -> PreparedHistory:
-        turns = self._split_into_turns(history)
-        context = context_messages or []
+        turns = self._split_into_turns(history)  # list[list[Message]]
 
-        required = [developer_message, *context, user_message]
+        # получаем int - стоимость всего контекста и сравниваем с бюджетом
+        required = [developer_message, *summary_message, user_message]
         if self._token_counter.count_messages(required) > self._budget:
             raise ChatHistoryError('Инструкция, summary и новое сообщение не помещаются в бюджет.')
 
-        selected: list[Message] = []
+        selected: list[Message] = []  # заполняем пока влезает из session.messages
         for turn in reversed(turns):
             candidate = [*turn, *selected]
             tokens = self._token_counter.count_messages(
-                [developer_message, *context, *candidate, user_message]
+                [developer_message, *summary_message, *candidate, user_message]
             )
             if tokens > self._budget:
                 break
             selected = candidate
 
-        messages = [developer_message, *context, *selected, user_message]
+        messages = [developer_message, *summary_message, *selected, user_message]
         return PreparedHistory(
             messages=messages,
             estimated_tokens=self._token_counter.count_messages(messages),
@@ -66,6 +74,8 @@ class SlidingWindowHistory:
             removed_history_messages=len(history) - len(selected),
         )
 
+    # для склейки на диалоговые пары внутри списка
+    # [['role':'user', 'content':...],['role':'assistant', 'content':...]]
     @staticmethod
     def _split_into_turns(history: list[Message]) -> list[list[Message]]:
         if len(history) % 2 != 0:
@@ -75,15 +85,3 @@ class SlidingWindowHistory:
             if [message['role'] for message in turn] != ['user', 'assistant']:
                 raise ChatHistoryError('Ожидалась пара сообщений user/assistant.')
         return turns
-
-
-
-
-
-
-
-
-
-
-
-

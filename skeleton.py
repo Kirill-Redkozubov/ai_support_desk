@@ -36,7 +36,7 @@ instruction = PROMPTS["1.1.0"]
 BUDGET = settings.chat_input_token_budget
 encoding = tiktoken.get_encoding('o200k_base')
 
-def count_tokens(messages):
+def count_tokens(messages: list):
     return 3 + sum(
         3 + len(encoding.encode(m['role'])) + len(encoding.encode(m['content']))
         for m in messages

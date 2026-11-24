@@ -16,20 +16,20 @@ class ConversationSummaryService:
         if not messages:
             raise ConversationSummaryError('Нет сообщений для суммаризации')
 
-        transcript = '\n'.join(
+        transcript = '\n'.join( # user меняем на Клиент, assistant на Поддержка
             f'{ROLE_NAMES.get(m['role'], m['role'])}: {m['content']}' for m in messages
         )
-        source = (
+        source = ( # добавляем старую summary если есть
             f'<previous_summary>\n{previous_summary or 'Отсутствует.'}\n</previous_summary>\n\n'
             f'<conversation_fragment>\n{transcript}\n</conversation_fragment>'
         )
-        request: list[Message] = [
+        request: list[Message] = [ # собираем промпт
             {'role': 'developer', 'content': SUMMARY_INSTRUCTION},
             {'role': 'user', 'content': source}
         ]
 
         try:
-            result = self._llm_client.generate(request)
+            result = self._llm_client.generate(request) # запрос к модели для пересказа
         except LLMClientError as error:
             raise ConversationSummaryError(f"Не удалось создать summary: {error}") from error
 
@@ -40,4 +40,4 @@ class ConversationSummaryService:
         summary = (result.text or "").strip()
         if not summary:
             raise ConversationSummaryError("Модель вернула пустое summary.")
-        return summary
+        return summary # str новый краткий пересказ

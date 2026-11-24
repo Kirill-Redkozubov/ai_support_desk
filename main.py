@@ -1,11 +1,15 @@
 from pydantic import ValidationError
 
 from app.chat_history import SlidingWindowHistory, TokenCounter
-from app.conversation_summary_service import ConversationSummaryService
+from app.services.conversation_summary_service import ConversationSummaryService
+from app.services.support_request_analyzer import SupportRequestAnalyzer
+from app.services.tool_loop import BoundedToolLoop
+from app.tools.default_registry import build_default_tool_registry
+from app.tools.execution import ToolExecutor
 from app.config import Settings
 from app.console import run_console
 from app.llm.client import LLMClient
-from app.chat_service import ChatService
+from app.services.chat_service import ChatService
 
 
 def main() -> None:
@@ -19,19 +23,33 @@ def main() -> None:
         return
 
     llm_client = LLMClient(settings)
+    tool_registry = build_default_tool_registry()
+    tool_executor = ToolExecutor(tool_registry)
+    tool_loop = BoundedToolLoop(
+        client=llm_client,
+        registry=tool_registry, # предоставляет функции
+        executor=tool_executor, # предоставляет результат функций
+        max_steps=settings.tool_max_steps,
+    )
+
     history_policy = SlidingWindowHistory(
         token_counter=TokenCounter(),
         input_token_budget=settings.chat_input_token_budget,
     )
     summary_service = ConversationSummaryService(llm_client)
     chat_service = ChatService(
-        llm_client,
+        tool_loop=tool_loop,
         history_policy=history_policy,
         summary_service=summary_service,
     )
+    request_analyzer = SupportRequestAnalyzer(llm_client)
     try:
-        run_console(chat_service, app_env=settings.app_env, configured_model=settings.model)
+        run_console(chat_service,
+                    request_analyzer,
+                    app_env=settings.app_env,
+                    configured_model=settings.model)
     finally:
+        tool_executor.close()
         llm_client.close()
 
 

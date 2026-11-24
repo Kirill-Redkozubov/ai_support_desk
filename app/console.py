@@ -1,13 +1,38 @@
 from uuid import uuid4
 
-from app.chat_service import (
+from app.services.chat_service import (
     ChatReply,
     ChatServiceError,
     ChatService,
     ChatStreamCompleted,
     ChatTextDelta,
 )
+from app.services.support_request_analyzer import (
+SupportRequestAnalyzer,
+SupportRequestAnalyzerError,
+)
+from app.services.support_request_review import (
+SupportRequestDecision,
+decide_review,
+)
 import readline
+
+# # для метриков результата вызова инструментов tool_call
+# def print_order_status_answer(result: OrderStatusAnswer) -> None:
+#     print(f'\nAssistant: {result.text}')
+#     print(
+#         'Инструмент использован: '
+#         f'{'да' if result.tool_used else 'нет'}'
+#     )
+#     if result.order_id is not None:
+#         print(f'Номер заказа: {result.order_id}')
+#     print(f'Промпт: {result.prompt_id}@{result.prompt_version}')
+#     print(f'Всего токенов: {result.total_tokens}')
+#     print(
+#         'ID ответов: '
+#         f'{', '.join(result.response_ids)}'
+#     )
+
 
 
 def print_metadata(result: ChatReply) -> None:
@@ -25,16 +50,46 @@ def print_metadata(result: ChatReply) -> None:
     else:
         print(f"Токены: вход {result.prompt_tokens}, "
               f"выход {result.completion_tokens}, всего {result.total_tokens}")
-    print(f"ID ответа: {result.response_id}")
+    print(f"Инструментов выполнено: {result.tool_calls_count}")
+    if result.tool_names:
+        print(f"Инструменты: {', '.join(result.tool_names)}")
+    print(f"ID ответов: {', '.join(result.response_ids)}")
+
+def print_analysis(decision: SupportRequestDecision) -> None:
+    result = decision.result
+
+    print('\nАнализ обращения:')
+    print(result.analysis.model_dump_json(indent=2))
+    print(
+        'Нужна проверка человеком: '
+        f'{'да' if decision.requires_human_review else 'нет'}'
+    )
+
+    if decision.review_reasons:
+        reasons = ', '.join(reason.value for reason in decision.review_reasons)
+        print(f'Причины проверки: {reasons}')
+
+    print(f'Промпт: {result.prompt_id}@{result.prompt_version}')
+    print(f'Исправляющих запросов: {result.repair_attempts}')
+    print(f'Время анализа: {result.elapsed_seconds:.2f} c')
+    print(f'Всего токенов: {result.total_tokens}')
+    print(f'ID ответа: {result.response_id}')
 
 
-def run_console(service: ChatService, app_env: str, configured_model: str) -> None:
+def run_console(service: ChatService,
+                analyzer: SupportRequestAnalyzer,
+                app_env: str,
+                configured_model: str,) -> None:
     print(f'Окружение: {app_env}')
     print(f'Настроенная модель: {configured_model}')
 
     session_id = uuid4().hex
     print(f'Session ID: {session_id}')
-    print("Команды: /new — новый диалог, /exit — выход.")
+    print(
+        "Команды: /new — новый диалог, "
+        "/analyze — анализ обращения, "
+        "/exit — выход."
+    )
     print('Во время ответа нажмите Ctrl+C, тобы отменить генерацию.')
 
     while True:
@@ -46,6 +101,16 @@ def run_console(service: ChatService, app_env: str, configured_model: str) -> No
             service.reset_session(session_id)
             session_id = uuid4().hex
             print(f'Новый Session ID: {session_id}')
+            continue
+        if command == '/analyze':
+            request_text = input('Обращение: ')
+            try:
+                analysis_result = analyzer.analyze(request_text)
+            except SupportRequestAnalyzerError as error:
+                print(f'Ошибка анализа: {error}')
+                continue
+            decision = decide_review(analysis_result)
+            print_analysis(decision)
             continue
 
         stream = service.stream_reply(session_id, user_text)
